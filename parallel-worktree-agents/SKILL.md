@@ -1,6 +1,6 @@
 ---
 name: parallel-worktree-agents
-description: Orchestrate parallel sub-agents across isolated git worktrees using only built-in tools (Agent, Bash, Write, Read). Use when the user wants to fan out multi-hour independent tasks that will later converge via merge — not for quick research fan-outs.
+description: Orchestrate parallel sub-agents across isolated git worktrees using only built-in tools (Agent, Bash, Write, Read). Consumes a `tasks.md` (produce one with the parallel-task-decomposition skill if absent). Use when the user wants to fan out multi-hour independent tasks that will later converge via merge — not for quick research fan-outs.
 ---
 
 # Parallel Worktree Agents
@@ -20,20 +20,20 @@ A skill for an orchestrator to spawn parallel sub-agents, each isolated in its o
 - One-shot jobs under ~15 minutes → the worktree setup overhead isn't worth it.
 - A non-git directory, or a repo with uncommitted chaos in the working tree.
 
-## Decomposition is your job (read this first)
+## Prerequisite: a `tasks.md` with a sound decomposition
 
-**This pattern does not decompose work for you. If the decomposition is wrong, nothing downstream saves you — not isolation, not verification, not merge order.** The orchestrator's hardest and least-delegable job is splitting the problem into tasks that are actually parallelizable.
+**The input to this skill is a `tasks.md` file (format below) whose task blocks satisfy the criteria in this section. If the decomposition is wrong, nothing downstream saves you — not isolation, not verification, not merge order.** Decomposition is the orchestrator's hardest and least-delegable job; if no `tasks.md` exists yet, invoke the `parallel-task-decomposition` skill first (or hand-write one to the same schema).
 
-What "good decomposition" means here:
+A task block is ready when it is:
 
-- **File-disjoint.** Task A and Task B touch non-overlapping file sets. State this in the `Files` line of each task block; if you can't, the tasks are not parallel — serialize them.
-- **Semantically independent.** Task A does not depend on a behavior Task B is in the middle of changing. Shared module, different function is often not independent enough. Ask: "If these ran in either order, would both still be correct?" If no, serialize.
-- **Self-contained objective.** A sub-agent can finish without asking a question. If the task needs a judgment call you haven't made, make it before spawning — not after, by interpreting a "blocked" broadcast.
-- **Right-sized.** Too small and the overhead dominates; too large and the context balloons and drifts. Aim for tasks a focused agent can finish in one session with the preamble + task block alone.
+- **File-disjoint.** Its `Files` line names a path set that does not overlap with any other parallel task's `Files`. If you can't state the set, the task is not parallelizable — serialize it.
+- **Semantically independent.** It does not depend on behavior another task is in the middle of changing. Shared module, different function is often not independent enough. Ask: "If these ran in either order, would both still be correct?" If no, serialize.
+- **Self-contained.** A sub-agent can finish from the preamble + block alone, without asking a question. If a judgment call is needed, make it in the block — not after, by interpreting a "blocked" broadcast.
+- **Right-sized.** Too small and overhead dominates; too large and context balloons and drifts. Aim for a focused agent finishing in one session.
 
 Frameworks like CrewAI and LangGraph hide bad decomposition behind coordination layers — agents negotiate, retry, replan. This pattern has no such cushion. A bad split surfaces immediately as a merge conflict, a semantic bug, or a sub-agent stuck asking questions it can't ask. That's a feature: **the pattern is honest about where the intelligence has to live, and it has to live in you.**
 
-If you find yourself repeatedly hitting merge conflicts or re-spawning blocked agents, the problem is almost never the sub-agents. It's the split. Stop, re-decompose, re-spawn. Do not tune prompts to paper over a structural mistake.
+If any task fails the checks above, stop and re-decompose before spawning. Do not invoke this skill and hope — that is not what this pattern offers. If you hit merge conflicts or re-spawn blocked agents mid-run, the problem is almost never the sub-agents; it's the split. Stop, re-decompose, re-spawn. Do not tune prompts to paper over a structural mistake.
 
 ## The five constraints (non-negotiable)
 
@@ -65,7 +65,9 @@ Set this up in the main repo before spawning anything:
 
 Add `.worktrees/` and `.shared/broadcasts/` to `.gitignore` at the start. `.shared/context.md` can be committed or not depending on whether the preamble is a durable artifact.
 
-## tasks.md contract
+## tasks.md format
+
+Schema the skill expects. See the prerequisite section for the decomposition properties each task block must satisfy.
 
 ```markdown
 ## Preamble
@@ -78,6 +80,7 @@ Add `.worktrees/` and `.shared/broadcasts/` to `.gitignore` at the start. `.shar
 
 ### TASK-001
 **Title**: Add OAuth provider
+**Status**: [ ]
 **Priority**: P1
 **Depends On**: —
 **Files** (expected): src/auth/oauth.ts, src/auth/oauth.test.ts
@@ -89,6 +92,7 @@ Add `.worktrees/` and `.shared/broadcasts/` to `.gitignore` at the start. `.shar
 
 ### TASK-002
 **Title**: Refactor session store
+**Status**: [ ]
 **Priority**: P2
 **Depends On**: —
 **Files** (expected): src/session/*.ts
@@ -96,7 +100,7 @@ Add `.worktrees/` and `.shared/broadcasts/` to `.gitignore` at the start. `.shar
 [...]
 ```
 
-The `Files` list is the contract that lets you predict merge conflicts *before* spawning. **If two task blocks name overlapping paths, the decomposition is wrong — fix it. Do not spawn and hope the agents will "figure it out."** They will not; that is not what this pattern offers.
+The `Files` list is what the skill uses to predict textual merge conflicts before spawning and to verify diffs after. `Status` starts as `[ ]` and flips to `[x]` via the Update procedure once a sub-agent's broadcast is verified against the diff.
 
 ## Spawn procedure
 
@@ -119,7 +123,9 @@ For each task to run in parallel:
    - Its broadcast file path: `.shared/broadcasts/TASK-001.md`
    - Instruction: when done, append a structured entry to the broadcast file and stop. Do not attempt to merge, switch branches, or coordinate with other agents.
    - **No mention of other sub-agents, the orchestration pattern, or this skill.** (Asymmetric knowledge.)
-5. **Spawn independent tasks in parallel** — one `Agent` call per task, all in a single message.
+5. **Spawn the current wave in parallel.** A task is *ready* when every task in its `Depends On` list has `Status: [x]`. Spawn all ready tasks — one `Agent` call per task, all in a single message. Tasks with unsatisfied deps do NOT spawn yet.
+
+After the wave completes (every spawned sub-agent has broadcast), run the Update procedure to mark done tasks `[x]` and decide what to do with blocked ones. Then compute the next wave and repeat until no ready tasks remain.
 
 ## Broadcast format
 
@@ -136,13 +142,26 @@ Sub-agents append one entry to their `TASK-<id>.md` broadcast file when they fin
 
 The orchestrator reads this, then runs `git -C .worktrees/TASK-001 diff wt/TASK-001 <base>` to verify the claim before trusting it.
 
+## Update procedure (after each wave)
+
+Once every sub-agent in the current wave has appended a broadcast, reconcile `tasks.md` before computing the next wave or merging:
+
+1. **Read every new broadcast.** Classify each: done / blocked / need-input.
+2. **Verify "done" claims against diffs.** `git -C .worktrees/TASK-xxx diff wt/TASK-xxx <base>` — files touched must match the `Files` line. If the diff includes surprise paths, treat the task as not-done and demote to blocked.
+3. **Update `Status`.** Flip verified "done" tasks to `[x]` in `tasks.md`. Leave blocked / need-input tasks as `[ ]` and append a short blocker note in the task block.
+4. **Handle blockers.** For each blocked task, choose: respawn with tighter context (same `Depends On`), serialize a prerequisite fix (new task it now depends on), or drop it. Edit `tasks.md` to reflect the choice.
+5. **Handle discovered work.** If a sub-agent surfaced a new required task (refactor, latent bug), add a `TASK-xxx` block with correct `Depends On`. This is scope expansion — surface it to the user before committing.
+6. **Re-check the decomposition.** If blockers keep recurring or diffs keep straying outside `Files`, the split is wrong. Stop, re-decompose, don't patch.
+
+`tasks.md` is the source of truth for what's been tried, what succeeded, and what's left. Keep it live across waves.
+
 ## Convergence (merge) procedure
 
-1. Read every broadcast file. Classify: done / blocked / need-input.
-2. For each "done" claim, verify with `git diff` — files touched match the claim, no surprise mutations.
-3. Topologically sort by `Depends On`.
-4. Merge in order: `git merge wt/TASK-001`, resolve if needed, repeat. If a conflict fires between tasks that *shouldn't* have overlapped, that's a decomposition bug — note it and fix the `Files` contract next time.
-5. Tear down: `git worktree remove .worktrees/TASK-001 && git branch -d wt/TASK-001`.
+When `tasks.md` shows all tasks as `[x]` (or explicitly dropped):
+
+1. Topologically sort completed tasks by `Depends On`.
+2. Merge in order: `git merge wt/TASK-001`, resolve if needed, repeat. If a conflict fires between tasks that *shouldn't* have overlapped, that's a decomposition bug — note it and fix the `Files` contract next time.
+3. Tear down: `git worktree remove .worktrees/TASK-001 && git branch -d wt/TASK-001`.
 
 ## State reconciliation
 
